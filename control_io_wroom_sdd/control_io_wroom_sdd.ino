@@ -4,27 +4,52 @@
 #include <esp_task_wdt.h>
 
 /**
- * CẤU HÌNH HỆ THỐNG PIXEL (OFFSET SUPPORT):
+ * CẤU HÌNH HỆ THỐNG PIXEL + INPUT:
  * - Board Core: ESP32 v2.0.17
  * - NeoPixelBus: v2.7.6
- * - Thêm tham số offset_ms (off) để dịch chuyển thời điểm bắt đầu hiệu ứng.
+ * - Hỗ trợ dịch chuyển thời điểm hiệu ứng (offset_ms / "off").
+ * - Tích hợp bộ cấu hình Input đa dụng (Digital/Analog với PULLUP/PULLDOWN) tính time_hold.
  */
 
 #define STRIP_COUNT          8
 #define NUM_CHANNELS         8
 #define MAX_TASKS_PER_PIN    10
-#define MAX_LEDS             500
-// #define COLOR_FEATURE        NeoBgrFeature
+#define MAX_LEDS             300
 #define COLOR_FEATURE        NeoGrbFeature
 
+// Logic IO phản hồi
+#define IO_ACTIVE   1
+#define IO_INACTIVE 0
+
 String BOARD_ID = "";
+
+// Cấu trúc quản lý Input (Digital/Analog & Pull mode)
+struct InputConfig {
+    int pin;
+    char type;    // 'D': Digital, 'A': Analog
+    int pinMode;  // INPUT_PULLUP, INPUT_PULLDOWN, hoặc INPUT
+};
+
+// Khai báo chân Input theo yêu cầu của bạn
+const InputConfig inputConfigs[] = {
+    {4, 'D', INPUT_PULLUP},   
+    {5, 'D', INPUT_PULLUP},
+    {13, 'D', INPUT_PULLUP},
+    {14, 'D', INPUT_PULLUP},
+    {32, 'D', INPUT_PULLUP},
+    {33, 'D', INPUT_PULLUP}
+};
+const int inputCount = sizeof(inputConfigs) / sizeof(inputConfigs[0]);
+
+// Quản lý thời gian Active cho Feedback (Chỉ dùng cho Input)
+unsigned long inputActiveStartTime[inputCount] = {0};
 
 struct StripConfig {
     uint8_t pin;
     const char* label;
 };
 
-// Ánh xạ Channel sang GPIO Pin
+// Ánh xạ Channel sang GPIO Pin cho dải LED
 const StripConfig STRIP_MAP[STRIP_COUNT] = {
     {25, "CH1"}, {26, "CH2"}, {27, "CH3"}, {23, "CH4"},
     {18, "CH5"}, {19, "CH6"}, {21, "CH7"}, {22, "CH8"}
@@ -52,7 +77,7 @@ struct LedTask {
     int interval;
     uint32_t time_blink;
     uint32_t duration;
-    uint32_t offset_ms; // Tham số offset mới
+    uint32_t offset_ms; // Tham số offset
     uint32_t fade_in;
     uint32_t fade_out;
     uint8_t brightness;
@@ -86,8 +111,33 @@ int getChannelIndex(const char* chanStr) {
     return -1;
 }
 
+String getPinLabel(InputConfig config) {
+    return String(config.type) + String(config.pin);
+}
+
+// Lấy giá trị logic tương ứng của Input phụ thuộc chế độ Pull mode
+int getLogicalValue(InputConfig config) {
+    if (config.type == 'A') return analogRead(config.pin);
+    int raw = digitalRead(config.pin);
+    if (config.pinMode == INPUT_PULLUP) {
+        return (raw == LOW) ? IO_ACTIVE : IO_INACTIVE;
+    } else {
+        return (raw == HIGH) ? IO_ACTIVE : IO_INACTIVE;
+    }
+}
+
+unsigned long calculateTimeHold(int logicalVal, unsigned long &startTime, unsigned long now) {
+    if (logicalVal == IO_ACTIVE) {
+        if (startTime == 0) startTime = now;
+        return now - startTime;
+    } else {
+        startTime = 0;
+        return 0;
+    }
+}
+
 /**
- * CÁC HÀM TRUY CẬP LED THEO INDEX (Sử dụng switch-case để tránh lỗi kiểu dữ liệu RMT)
+ * CÁC HÀM TRUY CẬP LED THEO INDEX
  */
 void showStrip(int idx) {
     switch(idx) {
@@ -134,6 +184,12 @@ void sendInfo() {
     doc["cmd"] = "info";
     JsonObject data = doc.createNestedObject("data");
     data["name"] = BOARD_ID;
+    
+    JsonArray inputs = data.createNestedArray("input");
+    for (int i = 0; i < inputCount; i++) {
+        inputs.add(getPinLabel(inputConfigs[i]));
+    }
+    
     JsonArray outputs = data.createNestedArray("output");
     for (int i = 0; i < STRIP_COUNT; i++) {
         outputs.add(STRIP_MAP[i].label);
@@ -143,19 +199,40 @@ void sendInfo() {
 }
 
 void sendFeedback() {
+    unsigned long now = millis();
     JsonDocument doc;
     doc["cmd"] = "feedback";
     JsonObject msg = doc.createNestedObject("msg");
     JsonObject dataObj = msg.createNestedObject("data");
-    JsonObject outputs = dataObj.createNestedObject("output");
+    JsonObject timeHoldObj = msg.createNestedObject("time_hold");
 
-    for (int i = 0; i < STRIP_COUNT; i++) {
-        bool active = false;
-        for (int s = 0; s < MAX_TASKS_PER_PIN; s++) {
-            if (g_tasks[i][s].active) { active = true; break; }
+    // Input - Trả về trạng thái logic thực tế và đếm Time Hold
+    JsonObject inputData = dataObj.createNestedObject("input");
+    JsonObject inputTime = timeHoldObj.createNestedObject("input");
+    for (int i = 0; i < inputCount; i++) {
+        String label = getPinLabel(inputConfigs[i]);
+        int logicalVal = getLogicalValue(inputConfigs[i]);
+        inputData[label] = logicalVal;
+        if (inputConfigs[i].type == 'D') {
+            inputTime[label] = calculateTimeHold(logicalVal, inputActiveStartTime[i], now);
+        } else {
+            inputTime[label] = 0;
         }
-        outputs[STRIP_MAP[i].label] = active ? 1 : 0;
     }
+
+    // Output - CH1 -> CH8 trả về trạng thái chạy hiệu ứng (1: Có active task, 0: Đứng yên)
+    JsonObject outputData = dataObj.createNestedObject("output");
+    for (int i = 0; i < STRIP_COUNT; i++) {
+        bool hasActiveTask = false;
+        for (int s = 0; s < MAX_TASKS_PER_PIN; s++) {
+            if (g_tasks[i][s].active) {
+                hasActiveTask = true;
+                break;
+            }
+        }
+        outputData[STRIP_MAP[i].label] = hasActiveTask ? 1 : 0;
+    }
+
     serializeJson(doc, Serial);
     Serial.println();
 }
@@ -196,7 +273,7 @@ void handleJsonInput(String jsonInput) {
             t->c2 = hexToRgb(doc["c2"]);
             t->color_change = (doc["cg"] == 1);
             t->duration = doc["dur"];
-            t->offset_ms = doc.containsKey("off") ? doc["off"] : 0; // Lấy offset
+            t->offset_ms = doc.containsKey("off") ? doc["off"] : 0; 
             t->time_change = doc.containsKey("t_cg") ? doc["t_cg"] : t->duration;
             t->blink = (doc["blk"] == 1);
             
@@ -239,12 +316,10 @@ void update_led_effects() {
                 continue; 
             }
 
-            // STREAM_CHUNK: Calculate current range based on speed. Speed 0 means instant fill.
             int direction = (t->end_led >= t->start_led) ? 1 : -1;
             int num_leds;
             
             if (t->speed <= 0) {
-                // Nếu tốc độ <= 0, coi như sáng toàn bộ dải ngay lập tức
                 num_leds = abs(t->end_led - t->start_led) + 1;
             } else {
                 num_leds = (effective_elapsed * t->speed) / 1000;
@@ -255,7 +330,6 @@ void update_led_effects() {
             if (direction == 1 && current_end > t->end_led) current_end = t->end_led;
             if (direction == -1 && current_end < t->end_led) current_end = t->end_led;
 
-            // 2. Tính toán màu sắc (Progress dựa trên effective_elapsed)
             RgbColor color = t->c2;
             if (t->color_change && t->time_change > 0) {
                 float f = (float)effective_elapsed / t->time_change;
@@ -263,7 +337,6 @@ void update_led_effects() {
                 color = RgbColor::LinearBlend(t->c1, t->c2, f);
             }
 
-            // 3. Tính toán Fade In / Fade Out
             float fadeFactor = 1.0f;
             if (t->fade_in > 0 && effective_elapsed < t->fade_in) {
                 fadeFactor = (float)effective_elapsed / t->fade_in;
@@ -275,7 +348,6 @@ void update_led_effects() {
             uint8_t finalBrightness = (uint8_t)(t->brightness * fadeFactor);
             if (finalBrightness < 255) color = color.Dim(finalBrightness);
 
-            // 4. Logic Blink (Sử dụng 'now' để đồng bộ nhịp nhưng 'effective_elapsed' để giới hạn tb)
             bool is_off = false;
             if (t->blink && t->interval > 0 && effective_elapsed < t->time_blink) {
                 is_off = (now / t->interval) % 2 == 0;
@@ -297,10 +369,14 @@ void setup() {
     Serial.begin(115200);
     Serial.setTimeout(50);
 
-    // BOARD_ID = getChipID();
-    BOARD_ID = "LEDS_PATIO";
+    BOARD_ID = "GAME_SDD";
     esp_task_wdt_init(8, true);
     esp_task_wdt_add(NULL);
+
+    // Khởi tạo các chân Input dựa trên struct config
+    for (int i = 0; i < inputCount; i++) {
+        pinMode(inputConfigs[i].pin, inputConfigs[i].pinMode);
+    }
 
     // Khởi tạo các dải LED RMT dựa trên bảng cấu hình STRIP_MAP
     strip0 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt0Ws2812xMethod>(MAX_LEDS, STRIP_MAP[0].pin); // CH1
@@ -329,7 +405,6 @@ void loop() {
     update_led_effects();
 
     if (now - lastFeedbackTime >= 1000) {
-        // sendFeedback();
         esp_task_wdt_reset();
         lastFeedbackTime = now;
     }

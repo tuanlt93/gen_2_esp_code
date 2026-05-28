@@ -9,8 +9,8 @@
 String BOARD_ID = "";
 
 // Logic Relay
-#define RELAY_ON    HIGH
-#define RELAY_OFF   LOW
+#define RELAY_ON    LOW
+#define RELAY_OFF   HIGH
 
 // Trạng thái logic phản hồi
 #define IO_ACTIVE   1
@@ -32,13 +32,14 @@ const InputConfig inputConfigs[] = {
     {16, 'D', INPUT_PULLUP},
     {17, 'D', INPUT_PULLUP},
     {18, 'D', INPUT_PULLUP},
+    // {41, 'D', INPUT_PULLUP},
 
 };
 const int inputCount = sizeof(inputConfigs) / sizeof(inputConfigs[0]);
 
 // Cấu trúc quản lý Output
 const int outputPins[] = {3, 8, 9, 10, 11, 12, 13, 14, 21, 35, 36, 37, 38, 39, 40};
-// const int outputPins[] = {3, 4, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40};
+// const int outputPins[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40};
 const int outputCount = sizeof(outputPins) / sizeof(outputPins[0]);
 
 // Quản lý thời gian Active cho Feedback (Chỉ dùng cho Input)
@@ -238,7 +239,8 @@ void setup() {
     Serial.begin(115200);
     Serial.setTimeout(50);
     
-    BOARD_ID = getChipID();
+    BOARD_ID = "S3_SDD";
+    // BOARD_ID = getChipID();
 
     esp_task_wdt_init(8, true);
     esp_task_wdt_add(NULL);

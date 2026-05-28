@@ -6,6 +6,7 @@
 /**
  * CẤU HÌNH DMX CHO ESP32 WROOM
  * TX: 17, EN: 4, 6 Kênh
+ * Hỗ trợ tham số offset_ms (off) để dịch chuyển thời điểm bắt đầu Fade.
  */
 
 #define DMX_TX_PIN 17
@@ -14,7 +15,7 @@
 #define NUM_CHANNELS 6
 
 // Cấu hình Scale vật lý để đèn không nháy ở mức thấp
-#define PHYSICAL_MIN 20
+#define PHYSICAL_MIN 5
 #define PHYSICAL_MAX 255
 
 // Ngưỡng thời gian tối thiểu để thực hiện hiệu ứng Fade (ms)
@@ -31,6 +32,7 @@ struct FadeTask {
     int stopVal;
     unsigned long startTime;
     unsigned long duration;
+    unsigned long offset_ms; // Tham số dịch chuyển thời gian
     unsigned long elapsedAtPause;
     bool active;            // Đang trong quá trình Fade
     bool paused;
@@ -116,9 +118,10 @@ void handleJsonCommand(String input) {
         if (idx != -1) {
             fadeTasks[idx].stopVal = constrain(msg["brt_stop"] | 0, 0, 255);
             fadeTasks[idx].duration = msg["duration"] | 0;
+            fadeTasks[idx].offset_ms = msg["offset"] | 0; // Nhận tham số off (offset_ms)
             
-            // Logic bảo vệ: Nếu duration < 800ms thì thực hiện ngay lập tức
-            if (fadeTasks[idx].duration < MIN_FADE_DURATION) {
+            // Logic bảo vệ: Nếu duration < 800ms hoặc offset >= duration thì thực hiện ngay lập tức
+            if (fadeTasks[idx].duration < MIN_FADE_DURATION || fadeTasks[idx].offset_ms >= fadeTasks[idx].duration) {
                 fadeTasks[idx].currentVal = fadeTasks[idx].stopVal;
                 fadeTasks[idx].active = false;
                 fadeTasks[idx].paused = false;
@@ -165,7 +168,9 @@ void handleJsonCommand(String input) {
 void setup() {
     Serial.begin(115200);
     Serial.setTimeout(50);
-    BOARD_ID = getChipID();
+
+    BOARD_ID = "DIMER_BI_MAT";
+    // BOARD_ID = getChipID();
 
     esp_task_wdt_init(8, true);
     esp_task_wdt_add(NULL);
@@ -182,6 +187,7 @@ void setup() {
         fadeTasks[i].currentVal = 0;
         fadeTasks[i].active = false;
         fadeTasks[i].paused = false;
+        fadeTasks[i].offset_ms = 0;
     }
 }
 
@@ -195,13 +201,14 @@ void loop() {
 
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if (fadeTasks[i].active && !fadeTasks[i].paused) {
-            unsigned long elapsed = now - fadeTasks[i].startTime;
+            unsigned long real_elapsed = now - fadeTasks[i].startTime;
+            unsigned long effective_elapsed = real_elapsed + fadeTasks[i].offset_ms;
             
-            if (elapsed >= fadeTasks[i].duration) {
+            if (effective_elapsed >= fadeTasks[i].duration) {
                 fadeTasks[i].currentVal = fadeTasks[i].stopVal;
                 fadeTasks[i].active = false;
             } else {
-                float progress = (float)elapsed / fadeTasks[i].duration;
+                float progress = (float)effective_elapsed / fadeTasks[i].duration;
                 fadeTasks[i].currentVal = fadeTasks[i].startVal + (int)((fadeTasks[i].stopVal - fadeTasks[i].startVal) * progress);
             }
         }
@@ -213,6 +220,7 @@ void loop() {
     dmx_send(DMX_PORT);
 
     if (now - lastFeedbackTime >= 1000) {
+        // sendFeedback();
         esp_task_wdt_reset();
         lastFeedbackTime = now;
     }

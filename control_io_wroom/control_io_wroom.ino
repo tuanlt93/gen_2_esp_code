@@ -24,8 +24,8 @@ struct InputConfig {
 };
 
 const InputConfig inputConfigs[] = {
-    // {18, 'D', INPUT_PULLUP},   
-    // {19, 'D', INPUT_PULLDOWN}, 
+    {18, 'D', INPUT_PULLDOWN},   
+    {19, 'D', INPUT_PULLDOWN}, 
     {34, 'A', INPUT}           
 };
 const int inputCount = sizeof(inputConfigs) / sizeof(inputConfigs[0]);
