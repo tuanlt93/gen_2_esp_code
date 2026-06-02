@@ -38,7 +38,9 @@ const InputConfig inputConfigs[] = {
 const int inputCount = sizeof(inputConfigs) / sizeof(inputConfigs[0]);
 
 // Cấu trúc quản lý Output
-const int outputPins[] = {3, 8, 9, 10, 11, 12, 13, 14, 21, 35, 36, 37, 38, 39, 40};
+const int outputPins[] = {3, 8, 9, 10};
+// const int outputPins[] = {3, 8, 9, 10, 11, 12, 13, 14, 21, 35, 36, 37, 38};
+// const int outputPins[] = {3, 8, 9, 10, 11, 12, 13, 14, 21, 35, 36, 37, 38, 39, 40};
 // const int outputPins[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40};
 const int outputCount = sizeof(outputPins) / sizeof(outputPins[0]);
 

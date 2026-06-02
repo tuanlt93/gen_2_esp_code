@@ -4,7 +4,7 @@
 #include <esp_task_wdt.h>
 
 /**
- * CẤU HÌNH HỆ THỐNG PIXEL (OFFSET SUPPORT):
+ * CẤU HÌNH HỆ THỐNG PIXEL (OFFSET SUPPORT - NO INPUT):
  * - Board Core: ESP32 v2.0.17
  * - NeoPixelBus: v2.7.6
  * - Thêm tham số offset_ms (off) để dịch chuyển thời điểm bắt đầu hiệu ứng.
@@ -14,8 +14,10 @@
 #define NUM_CHANNELS         8
 #define MAX_TASKS_PER_PIN    10
 #define MAX_LEDS             500
-// #define COLOR_FEATURE        NeoBgrFeature
 #define COLOR_FEATURE        NeoGrbFeature
+
+// Giới hạn Frame Rate (Tránh lỗi LED không kịp Latch gây chớp màu sai)
+#define FRAME_DELAY          25 // 25ms = 40 FPS. Có thể giảm xuống 20 (50FPS) nếu cần
 
 String BOARD_ID = "";
 
@@ -52,7 +54,7 @@ struct LedTask {
     int interval;
     uint32_t time_blink;
     uint32_t duration;
-    uint32_t offset_ms; // Tham số offset mới
+    uint32_t offset_ms; // Tham số offset
     uint32_t fade_in;
     uint32_t fade_out;
     uint8_t brightness;
@@ -62,6 +64,10 @@ struct LedTask {
 
 LedTask g_tasks[STRIP_COUNT][MAX_TASKS_PER_PIN];
 unsigned long lastFeedbackTime = 0;
+unsigned long lastFrameTime = 0; // Biến giữ thời gian cho Frame Rate
+
+// Cờ kiểm soát: true nếu có ít nhất một tác vụ LED đang hoạt động
+bool g_anyTaskActive = false;
 
 /**
  * HÀM HỖ TRỢ
@@ -160,6 +166,21 @@ void sendFeedback() {
     Serial.println();
 }
 
+// Cập nhật trạng thái toàn cục để kiểm soát xử lý vòng lặp cập nhật LED
+void updateGlobalActiveFlag() {
+    bool found = false;
+    for (int i = 0; i < STRIP_COUNT; i++) {
+        for (int s = 0; s < MAX_TASKS_PER_PIN; s++) {
+            if (g_tasks[i][s].active) {
+                found = true;
+                break;
+            }
+        }
+        if (found) break;
+    }
+    g_anyTaskActive = found;
+}
+
 void handleJsonInput(String jsonInput) {
     StaticJsonDocument<1024> doc;
     DeserializationError error = deserializeJson(doc, jsonInput);
@@ -208,16 +229,23 @@ void handleJsonInput(String jsonInput) {
             t->fade_in = doc.containsKey("fi") ? doc["fi"] : 0;
             t->fade_out = doc.containsKey("fo") ? doc["fo"] : 0;
             t->brightness = doc.containsKey("b") ? doc["b"] : 150;
+
+            // Kích hoạt cờ có tác vụ đang chạy
+            g_anyTaskActive = true;
         } 
         else if (cmd == 0) { // Stop
             for (int i = 0; i < MAX_TASKS_PER_PIN; i++) g_tasks[idx][i].active = false;
             clearStrip(idx); showStrip(idx);
+            // Cập nhật lại cờ kiểm soát toàn cục
+            updateGlobalActiveFlag();
         }
     }
 }
 
 void update_led_effects() {
     uint32_t now = millis();
+    bool foundActive = false; // Theo dõi xem còn tác vụ nào đang hoạt động không
+
     for (int idx = 0; idx < STRIP_COUNT; idx++) {
         bool has_active = false;
         for (int s = 0; s < MAX_TASKS_PER_PIN; s++) {
@@ -231,6 +259,8 @@ void update_led_effects() {
             LedTask *t = &g_tasks[idx][s];
             if (!t->active) continue;
 
+            foundActive = true; // Phát hiện thấy tác vụ đang chạy
+
             uint32_t real_elapsed = now - t->start_time;
             uint32_t effective_elapsed = real_elapsed + t->offset_ms;
 
@@ -239,7 +269,6 @@ void update_led_effects() {
                 continue; 
             }
 
-            // STREAM_CHUNK: Calculate current range based on speed. Speed 0 means instant fill.
             int direction = (t->end_led >= t->start_led) ? 1 : -1;
             int num_leds;
             
@@ -291,13 +320,15 @@ void update_led_effects() {
         }
         showStrip(idx); 
     }
+
+    // Cập nhật lại cờ trạng thái toàn cục sau khi quét qua toàn bộ kênh
+    g_anyTaskActive = foundActive;
 }
 
 void setup() {
     Serial.begin(115200);
     Serial.setTimeout(50);
 
-    // BOARD_ID = getChipID();
     BOARD_ID = "LEDS_PATIO";
     esp_task_wdt_init(8, true);
     esp_task_wdt_add(NULL);
@@ -312,10 +343,15 @@ void setup() {
     strip6 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt6Ws2812xMethod>(MAX_LEDS, STRIP_MAP[6].pin); // CH7
     strip7 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt7Ws2812xMethod>(MAX_LEDS, STRIP_MAP[7].pin); // CH8
 
-    if(strip0) strip0->Begin(); if(strip1) strip1->Begin();
-    if(strip2) strip2->Begin(); if(strip3) strip3->Begin();
-    if(strip4) strip4->Begin(); if(strip5) strip5->Begin();
-    if(strip6) strip6->Begin(); if(strip7) strip7->Begin();
+    // Bắt đầu và TẮT HẾT LED ngay khi khởi động nhằm tránh tình trạng LED sáng ngẫu nhiên
+    if(strip0) { strip0->Begin(); clearStrip(0); showStrip(0); }
+    if(strip1) { strip1->Begin(); clearStrip(1); showStrip(1); }
+    if(strip2) { strip2->Begin(); clearStrip(2); showStrip(2); }
+    if(strip3) { strip3->Begin(); clearStrip(3); showStrip(3); }
+    if(strip4) { strip4->Begin(); clearStrip(4); showStrip(4); }
+    if(strip5) { strip5->Begin(); clearStrip(5); showStrip(5); }
+    if(strip6) { strip6->Begin(); clearStrip(6); showStrip(6); }
+    if(strip7) { strip7->Begin(); clearStrip(7); showStrip(7); }
 
     Serial.println("ESP32 PIXEL CHANNEL CONTROLLER READY.");
 }
@@ -326,10 +362,15 @@ void loop() {
     }
 
     unsigned long now = millis();
-    update_led_effects();
+
+    // Giới hạn Frame Rate: Chỉ cập nhật khi có tác vụ hoạt động và đủ thời gian trễ FRAME_DELAY
+    if (g_anyTaskActive && (now - lastFrameTime >= FRAME_DELAY)) {
+        update_led_effects();
+        lastFrameTime = now;
+    }
 
     if (now - lastFeedbackTime >= 1000) {
-        // sendFeedback();
+        // sendFeedback(); // Bỏ comment nếu muốn gửi status định kỳ mỗi giây
         esp_task_wdt_reset();
         lastFeedbackTime = now;
     }
