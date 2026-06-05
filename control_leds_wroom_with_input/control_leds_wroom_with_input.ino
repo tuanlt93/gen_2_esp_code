@@ -2,6 +2,9 @@
 #include <ArduinoJson.h>
 #include <NeoPixelBus.h>
 #include <esp_task_wdt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 /**
  * CẤU HÌNH HỆ THỐNG PIXEL + INPUT:
@@ -16,7 +19,7 @@
 #define COLOR_FEATURE        NeoGrbFeature
 
 // Giới hạn Frame Rate (Tránh lỗi LED không kịp Latch gây chớp màu sai)
-#define FRAME_DELAY          25 // 25ms = 40 FPS. Có thể giảm xuống 20 (50FPS) nếu cần
+#define FRAME_DELAY          25 // 25ms = 40 FPS.
 
 // Logic IO phản hồi
 #define IO_ACTIVE   1
@@ -42,6 +45,9 @@ const InputConfig inputConfigs[] = {
 const int inputCount = sizeof(inputConfigs) / sizeof(inputConfigs[0]);
 
 unsigned long inputActiveStartTime[inputCount] = {0};
+int lastInputState[inputCount] = {0};
+
+SemaphoreHandle_t serialMutex; // Mutex bảo vệ quá trình ghi Serial khỏi đụng độ
 
 struct StripConfig {
     uint8_t pin;
@@ -81,11 +87,13 @@ struct LedTask {
     uint8_t brightness;
     uint32_t start_time;
     bool active;
+    bool is_turning_off;
+    uint32_t turn_off_start_time;
+    int turn_off_speed;
 };
 
 LedTask g_tasks[STRIP_COUNT][MAX_TASKS_PER_PIN];
-unsigned long lastFeedbackTime = 0;
-unsigned long lastFrameTime = 0; // Biến giữ thời gian cho Frame Rate
+unsigned long lastFrameTime = 0; 
 
 bool g_anyTaskActive = false;
 
@@ -126,16 +134,17 @@ unsigned long calculateTimeHold(int logicalVal, unsigned long &startTime, unsign
     }
 }
 
+// XUẤT TUẦN TỰ: Đợi dải LED trước truyền xong tín hiệu mới gửi tín hiệu dải tiếp theo
 void showStrip(int idx) {
     switch(idx) {
-        case 0: if(strip0) strip0->Show(); break;
-        case 1: if(strip1) strip1->Show(); break;
-        case 2: if(strip2) strip2->Show(); break;
-        case 3: if(strip3) strip3->Show(); break;
-        case 4: if(strip4) strip4->Show(); break;
-        case 5: if(strip5) strip5->Show(); break;
-        case 6: if(strip6) strip6->Show(); break;
-        case 7: if(strip7) strip7->Show(); break;
+        case 0: if(strip0) { strip0->Show(); while(!strip0->CanShow()) yield(); } break;
+        case 1: if(strip1) { strip1->Show(); while(!strip1->CanShow()) yield(); } break;
+        case 2: if(strip2) { strip2->Show(); while(!strip2->CanShow()) yield(); } break;
+        case 3: if(strip3) { strip3->Show(); while(!strip3->CanShow()) yield(); } break;
+        case 4: if(strip4) { strip4->Show(); while(!strip4->CanShow()) yield(); } break;
+        case 5: if(strip5) { strip5->Show(); while(!strip5->CanShow()) yield(); } break;
+        case 6: if(strip6) { strip6->Show(); while(!strip6->CanShow()) yield(); } break;
+        case 7: if(strip7) { strip7->Show(); while(!strip7->CanShow()) yield(); } break;
     }
 }
 
@@ -181,8 +190,12 @@ void sendInfo() {
     for (int i = 0; i < STRIP_COUNT; i++) {
         outputs.add(STRIP_MAP[i].label);
     }
-    serializeJson(doc, Serial);
-    Serial.println();
+    
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY)) {
+        serializeJson(doc, Serial);
+        Serial.println();
+        xSemaphoreGive(serialMutex);
+    }
 }
 
 void sendFeedback() {
@@ -206,20 +219,13 @@ void sendFeedback() {
         }
     }
 
-    JsonObject outputData = dataObj.createNestedObject("output");
-    for (int i = 0; i < STRIP_COUNT; i++) {
-        bool hasActiveTask = false;
-        for (int s = 0; s < MAX_TASKS_PER_PIN; s++) {
-            if (g_tasks[i][s].active) {
-                hasActiveTask = true;
-                break;
-            }
-        }
-        outputData[STRIP_MAP[i].label] = hasActiveTask ? 1 : 0;
-    }
+    dataObj.createNestedObject("output");
 
-    serializeJson(doc, Serial);
-    Serial.println();
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY)) {
+        serializeJson(doc, Serial);
+        Serial.println();
+        xSemaphoreGive(serialMutex);
+    }
 }
 
 void updateGlobalActiveFlag() {
@@ -237,7 +243,8 @@ void updateGlobalActiveFlag() {
 }
 
 void handleJsonInput(String jsonInput) {
-    StaticJsonDocument<1024> doc;
+    // Tăng kích thước document lên 2048 để xử lý JSON Array thoải mái
+    StaticJsonDocument<2048> doc;
     DeserializationError error = deserializeJson(doc, jsonInput);
     if (error) return;
 
@@ -251,46 +258,113 @@ void handleJsonInput(String jsonInput) {
 
     if (doc.containsKey("c")) {
         int cmd = doc["c"];
-        const char* ch_label = doc["ch"];
-        int idx = getChannelIndex(ch_label);
-        if (idx == -1) return;
+        
+        // Bắt buộc phải có key "ch"
+        if (!doc.containsKey("ch")) return;
 
-        if (cmd == 1) { // Start Task
-            int slot = -1;
-            for (int i = 0; i < MAX_TASKS_PER_PIN; i++) {
-                if (!g_tasks[idx][i].active) { slot = i; break; }
-            }
-            if (slot == -1) slot = 0; 
+        // "ch" nay luôn được truyền vào dưới dạng mảng (ví dụ: ["CH5", "CH6"]) để tăng tốc độ xử lý
+        JsonArray ch_array = doc["ch"].as<JsonArray>();
+        if (ch_array.isNull()) return; // Đảm bảo an toàn, thoát nếu "ch" không phải là mảng
+        
+        int loop_count = ch_array.size();
 
-            LedTask *t = &g_tasks[idx][slot];
-            t->active = true;
-            t->start_time = millis();
-            t->start_led = doc["r"][0];
-            t->end_led = doc["r"][1];
-            t->speed = doc["spd"];
-            t->c1 = hexToRgb(doc["c1"]);
-            t->c2 = hexToRgb(doc["c2"]);
-            t->color_change = (doc["cg"] == 1);
-            t->duration = doc["dur"];
-            t->offset_ms = doc.containsKey("off") ? doc["off"] : 0; 
-            t->time_change = doc.containsKey("t_cg") ? doc["t_cg"] : t->duration;
-            t->blink = (doc["blk"] == 1);
+        // Lặp qua tất cả các channel được yêu cầu
+        for (int k = 0; k < loop_count; k++) {
+            const char* ch_label = ch_array[k].as<const char*>();
+            int idx = getChannelIndex(ch_label);
             
-            int intervalVal = doc.containsKey("int") ? doc["int"] : 0;
-            if (t->blink && intervalVal <= 0) intervalVal = 200; 
-            t->interval = intervalVal;
+            // Bỏ qua nếu channel không hợp lệ
+            if (idx == -1) continue;
 
-            t->time_blink = doc.containsKey("tb") ? doc["tb"] : t->duration;
-            t->fade_in = doc.containsKey("fi") ? doc["fi"] : 0;
-            t->fade_out = doc.containsKey("fo") ? doc["fo"] : 0;
-            t->brightness = doc.containsKey("b") ? doc["b"] : 150;
+            if (cmd == 1) { // Start Task
+                int slot = -1;
+                for (int i = 0; i < MAX_TASKS_PER_PIN; i++) {
+                    if (!g_tasks[idx][i].active) { slot = i; break; }
+                }
+                if (slot == -1) slot = 0; 
 
-            g_anyTaskActive = true;
-        } 
-        else if (cmd == 0) { // Stop
-            for (int i = 0; i < MAX_TASKS_PER_PIN; i++) g_tasks[idx][i].active = false;
-            clearStrip(idx); showStrip(idx);
-            updateGlobalActiveFlag();
+                LedTask *t = &g_tasks[idx][slot];
+                t->active = true;
+                t->start_time = millis();
+                t->start_led = doc["r"][0];
+                t->end_led = doc["r"][1];
+                t->speed = doc["spd"];
+                t->c1 = hexToRgb(doc["c1"]);
+                t->c2 = hexToRgb(doc["c2"]);
+                t->color_change = (doc["cg"] == 1);
+                t->duration = doc["dur"];
+                t->offset_ms = doc.containsKey("off") ? doc["off"] : 0; 
+                t->time_change = doc.containsKey("t_cg") ? doc["t_cg"] : t->duration;
+                t->blink = (doc["blk"] == 1);
+                
+                int intervalVal = doc.containsKey("int") ? doc["int"] : 0;
+                if (t->blink && intervalVal <= 0) intervalVal = 200; 
+                t->interval = intervalVal;
+
+                t->time_blink = doc.containsKey("tb") ? doc["tb"] : t->duration;
+                t->fade_in = doc.containsKey("fi") ? doc["fi"] : 0;
+                t->fade_out = doc.containsKey("fo") ? doc["fo"] : 0;
+                t->brightness = doc.containsKey("b") ? doc["b"] : 150;
+
+                t->is_turning_off = false;
+                t->turn_off_start_time = 0;
+                t->turn_off_speed = 0;
+
+                g_anyTaskActive = true;
+            } 
+            else if (cmd == 0) { // Stop Task
+                bool has_spd = doc.containsKey("spd");
+                int spd = has_spd ? doc["spd"] : 0;
+
+                if (doc.containsKey("r")) {
+                    int r_start = doc["r"][0];
+                    int r_end = doc["r"][1];
+                    int min_r = min(r_start, r_end);
+                    int max_r = max(r_start, r_end);
+
+                    for (int i = 0; i < MAX_TASKS_PER_PIN; i++) {
+                        if (g_tasks[idx][i].active) {
+                            int t_min = min(g_tasks[idx][i].start_led, g_tasks[idx][i].end_led);
+                            int t_max = max(g_tasks[idx][i].start_led, g_tasks[idx][i].end_led);
+                            
+                            if (t_min <= max_r && t_max >= min_r) {
+                                if (has_spd && spd > 0) {
+                                    g_tasks[idx][i].is_turning_off = true;
+                                    g_tasks[idx][i].turn_off_start_time = millis();
+                                    g_tasks[idx][i].turn_off_speed = spd;
+                                } else {
+                                    g_tasks[idx][i].active = false;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!has_spd || spd <= 0) {
+                        for (int i = min_r; i <= max_r; i++) {
+                            setPixel(idx, i, RgbColor(0));
+                        }
+                        showStrip(idx); // Được gọi tuần tự nhờ hàm showStrip()
+                    }
+                    updateGlobalActiveFlag();
+                } else {
+                    for (int i = 0; i < MAX_TASKS_PER_PIN; i++) {
+                        if (g_tasks[idx][i].active) {
+                            if (has_spd && spd > 0) {
+                                g_tasks[idx][i].is_turning_off = true;
+                                g_tasks[idx][i].turn_off_start_time = millis();
+                                g_tasks[idx][i].turn_off_speed = spd;
+                            } else {
+                                g_tasks[idx][i].active = false;
+                            }
+                        }
+                    }
+                    if (!has_spd || spd <= 0) {
+                        clearStrip(idx); 
+                        showStrip(idx); // Được gọi tuần tự nhờ hàm showStrip()
+                    }
+                    updateGlobalActiveFlag();
+                }
+            }
         }
     }
 }
@@ -317,7 +391,7 @@ void update_led_effects() {
             uint32_t real_elapsed = now - t->start_time;
             uint32_t effective_elapsed = real_elapsed + t->offset_ms;
 
-            if (effective_elapsed >= t->duration) { 
+            if (!t->is_turning_off && effective_elapsed >= t->duration) { 
                 t->active = false; 
                 continue; 
             }
@@ -335,6 +409,20 @@ void update_led_effects() {
 
             if (direction == 1 && current_end > t->end_led) current_end = t->end_led;
             if (direction == -1 && current_end < t->end_led) current_end = t->end_led;
+
+            int current_start = t->start_led;
+            
+            if (t->is_turning_off) {
+                uint32_t off_elapsed = now - t->turn_off_start_time;
+                int off_num_leds = (off_elapsed * t->turn_off_speed) / 1000;
+                current_start = t->start_led + (off_num_leds * direction);
+
+                if ((direction == 1 && current_start > current_end) || 
+                    (direction == -1 && current_start < current_end)) {
+                    t->active = false;
+                    continue;
+                }
+            }
 
             RgbColor color = t->c2;
             if (t->color_change && t->time_change > 0) {
@@ -360,17 +448,40 @@ void update_led_effects() {
             }
 
             if (!is_off) {
-                int loop_start = min(t->start_led, current_end);
-                int loop_end = max(t->start_led, current_end);
+                int loop_start = min(current_start, current_end);
+                int loop_end = max(current_start, current_end);
                 for (int i = loop_start; i <= loop_end; i++) {
                     setPixel(idx, i, color);
                 }
             }
         }
-        showStrip(idx); 
+        showStrip(idx); // Xuất an toàn, tuần tự
     }
 
     g_anyTaskActive = foundActive;
+}
+
+// Luồng Task xử lý Input chạy độc lập trên Core 0
+void inputProcessingTask(void *pvParameters) {
+    unsigned long lastCheckTime = 0;
+    for (;;) {
+        unsigned long now = millis();
+        if (now - lastCheckTime >= 20) {
+            lastCheckTime = now;
+            bool inputChanged = false;
+            for (int i = 0; i < inputCount; i++) {
+                int currentVal = getLogicalValue(inputConfigs[i]);
+                if (currentVal != lastInputState[i]) {
+                    lastInputState[i] = currentVal;
+                    inputChanged = true;
+                }
+            }
+            if (inputChanged) {
+                sendFeedback();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 void setup() {
@@ -381,11 +492,23 @@ void setup() {
     esp_task_wdt_init(8, true);
     esp_task_wdt_add(NULL);
 
+    serialMutex = xSemaphoreCreateMutex(); 
+
     for (int i = 0; i < inputCount; i++) {
         pinMode(inputConfigs[i].pin, inputConfigs[i].pinMode);
+        lastInputState[i] = getLogicalValue(inputConfigs[i]); 
     }
 
-    // Khởi tạo các dải LED RMT với phương thức mặc định của thư viện
+    xTaskCreatePinnedToCore(
+        inputProcessingTask, 
+        "InputTask",         
+        4096,                
+        NULL,                
+        1,                   
+        NULL,                
+        0                    
+    );
+
     strip0 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt0Ws2812xMethod>(MAX_LEDS, STRIP_MAP[0].pin);
     strip1 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt1Ws2812xMethod>(MAX_LEDS, STRIP_MAP[1].pin);
     strip2 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt2Ws2812xMethod>(MAX_LEDS, STRIP_MAP[2].pin);
@@ -395,7 +518,6 @@ void setup() {
     strip6 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt6Ws2812xMethod>(MAX_LEDS, STRIP_MAP[6].pin);
     strip7 = new NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt7Ws2812xMethod>(MAX_LEDS, STRIP_MAP[7].pin);
 
-    // Bắt đầu và tắt toàn bộ LED ngay khi khởi động
     if(strip0) { strip0->Begin(); clearStrip(0); showStrip(0); }
     if(strip1) { strip1->Begin(); clearStrip(1); showStrip(1); }
     if(strip2) { strip2->Begin(); clearStrip(2); showStrip(2); }
@@ -415,14 +537,16 @@ void loop() {
 
     unsigned long now = millis();
 
-    // Giới hạn Frame Rate: Chỉ cập nhật khi đủ thời gian FRAME_DELAY (ví dụ 25ms)
+    // Cập nhật LED với thời gian trễ chuẩn chống bóp nghẹt Frame
     if (g_anyTaskActive && (now - lastFrameTime >= FRAME_DELAY)) {
         update_led_effects();
-        lastFrameTime = now;
+        // Lấy thời gian hiện tại SAU KHI đã xuất xong LED để đảm bảo có thời gian nghỉ
+        lastFrameTime = millis(); 
     }
 
-    if (now - lastFeedbackTime >= 1000) {
-        esp_task_wdt_reset();
-        lastFeedbackTime = now;
+    static unsigned long lastWdtTime = 0;
+    if (now - lastWdtTime >= 1000) {
+        esp_task_wdt_reset(); 
+        lastWdtTime = now;
     }
 }

@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 /**
  * CẤU HÌNH HỆ THỐNG CHO ESP32-S3
@@ -32,20 +35,22 @@ const InputConfig inputConfigs[] = {
     {16, 'D', INPUT_PULLUP},
     {17, 'D', INPUT_PULLUP},
     {18, 'D', INPUT_PULLUP},
-    // {41, 'D', INPUT_PULLUP},
-
+    {41, 'D', INPUT_PULLUP},
 };
 const int inputCount = sizeof(inputConfigs) / sizeof(inputConfigs[0]);
+
+// Quản lý thời gian Active và trạng thái của Input để quét sự thay đổi
+unsigned long inputActiveStartTime[inputCount] = {0};
+int lastInputState[inputCount] = {0};
+
+SemaphoreHandle_t serialMutex; // Mutex bảo vệ quá trình ghi Serial
 
 // Cấu trúc quản lý Output
 const int outputPins[] = {3, 8, 9, 10};
 // const int outputPins[] = {3, 8, 9, 10, 11, 12, 13, 14, 21, 35, 36, 37, 38};
 // const int outputPins[] = {3, 8, 9, 10, 11, 12, 13, 14, 21, 35, 36, 37, 38, 39, 40};
-// const int outputPins[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40};
+// const int outputPins[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 35, 36, 37, 38, 39, 40}
 const int outputCount = sizeof(outputPins) / sizeof(outputPins[0]);
-
-// Quản lý thời gian Active cho Feedback (Chỉ dùng cho Input)
-unsigned long inputActiveStartTime[inputCount] = {0};
 
 // Cấu trúc quản lý tác vụ Blink
 struct BlinkTask {
@@ -60,7 +65,6 @@ struct BlinkTask {
 };
 
 BlinkTask blinkTasks[outputCount];
-unsigned long lastFeedbackTime = 0;
 
 /**
  * CÁC HÀM HỖ TRỢ
@@ -131,8 +135,12 @@ void sendInfo() {
         outputs.add(getOutputLabel(outputPins[i]));
     }
 
-    serializeJson(doc, Serial);
-    Serial.println();
+    // Yêu cầu Mutex trước khi in
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY)) {
+        serializeJson(doc, Serial);
+        Serial.println();
+        xSemaphoreGive(serialMutex);
+    }
 }
 
 /**
@@ -160,7 +168,7 @@ void sendFeedback() {
         }
     }
 
-    // Output - Chỉ gửi Data, không gửi Time Hold
+    // Output - Tính toán và gửi trạng thái Relay hiện tại
     JsonObject outputData = dataObj.createNestedObject("output");
     for (int i = 0; i < outputCount; i++) {
         int pin = outputPins[i];
@@ -169,8 +177,12 @@ void sendFeedback() {
         outputData[label] = logicalVal;
     }
 
-    serializeJson(doc, Serial);
-    Serial.println();
+    // Yêu cầu Mutex trước khi in
+    if (xSemaphoreTake(serialMutex, portMAX_DELAY)) {
+        serializeJson(doc, Serial);
+        Serial.println();
+        xSemaphoreGive(serialMutex);
+    }
 }
 
 /**
@@ -185,6 +197,7 @@ void handleJsonCommand(String input) {
 
     if (strcmp(cmd, "io") == 0) {
         JsonObject msg = doc["msg"];
+        bool ioChanged = false;
         for (JsonPair kv : msg) {
             int pin = getPinNumber(kv.key().c_str());
             int val = kv.value().as<int>();
@@ -192,7 +205,12 @@ void handleJsonCommand(String input) {
             if (idx != -1) {
                 blinkTasks[idx].active = false; 
                 digitalWrite(pin, (val == IO_ACTIVE) ? RELAY_ON : RELAY_OFF);
+                ioChanged = true;
             }
+        }
+        // Gửi feedback ngay lập tức sau khi thay đổi trạng thái io
+        if (ioChanged) {
+            sendFeedback();
         }
     } 
     else if (strcmp(cmd, "blink") == 0) {
@@ -237,6 +255,32 @@ void handleJsonCommand(String input) {
     }
 }
 
+// Luồng Task xử lý Input độc lập (Core 0)
+void inputProcessingTask(void *pvParameters) {
+    unsigned long lastCheckTime = 0;
+    for (;;) {
+        unsigned long now = millis();
+        // Quét sự thay đổi của Input với chu kỳ 20ms (debounce)
+        if (now - lastCheckTime >= 20) {
+            lastCheckTime = now;
+            bool inputChanged = false;
+            for (int i = 0; i < inputCount; i++) {
+                int currentVal = getLogicalValue(inputConfigs[i]);
+                if (currentVal != lastInputState[i]) {
+                    lastInputState[i] = currentVal;
+                    inputChanged = true;
+                }
+            }
+            // Gửi feedback lập tức khi có sự kiện thay đổi
+            if (inputChanged) {
+                sendFeedback();
+            }
+        }
+        // Yield giúp nhường quyền sử dụng Core 0 cho các tính năng nền của hệ điều hành
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.setTimeout(50);
@@ -247,8 +291,11 @@ void setup() {
     esp_task_wdt_init(8, true);
     esp_task_wdt_add(NULL);
 
+    serialMutex = xSemaphoreCreateMutex(); // Khởi tạo Mutex bảo vệ Serial
+
     for (int i = 0; i < inputCount; i++) {
         pinMode(inputConfigs[i].pin, inputConfigs[i].pinMode);
+        lastInputState[i] = getLogicalValue(inputConfigs[i]); // Lấy trạng thái khởi tạo
     }
 
     for (int i = 0; i < outputCount; i++) {
@@ -258,6 +305,17 @@ void setup() {
         blinkTasks[i].active = false;
         blinkTasks[i].paused = false;
     }
+
+    // Gắn Task quét Input vào Core 0
+    xTaskCreatePinnedToCore(
+        inputProcessingTask, 
+        "InputTask", 
+        4096, 
+        NULL, 
+        1, 
+        NULL, 
+        0 // Core 0
+    );
 }
 
 void loop() {
@@ -267,6 +325,7 @@ void loop() {
 
     unsigned long now = millis();
 
+    // Xử lý các tác vụ chớp tắt Relay (Core 1)
     for (int i = 0; i < outputCount; i++) {
         if (blinkTasks[i].active) {
             if (now - blinkTasks[i].startTime >= blinkTasks[i].duration) {
@@ -283,8 +342,9 @@ void loop() {
         }
     }
 
-    if (now - lastFeedbackTime >= 1000) {
-        esp_task_wdt_reset();
-        lastFeedbackTime = now;
+    static unsigned long lastWdtTime = 0;
+    if (now - lastWdtTime >= 1000) {
+        esp_task_wdt_reset(); // Tránh Watchdog Reset
+        lastWdtTime = now;
     }
 }
