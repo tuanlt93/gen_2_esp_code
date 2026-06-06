@@ -72,7 +72,7 @@ NeoPixelBus<COLOR_FEATURE, NeoEsp32Rmt7Ws2812xMethod>* strip7 = NULL;
 struct LedTask {
     int start_led;
     int end_led;
-    int speed;
+    float speed;
     RgbColor c1;
     RgbColor c2;
     bool color_change;
@@ -89,7 +89,7 @@ struct LedTask {
     bool active;
     bool is_turning_off;
     uint32_t turn_off_start_time;
-    int turn_off_speed;
+    float turn_off_speed;
 };
 
 LedTask g_tasks[STRIP_COUNT][MAX_TASKS_PER_PIN];
@@ -288,7 +288,7 @@ void handleJsonInput(String jsonInput) {
                 t->start_time = millis();
                 t->start_led = doc["r"][0];
                 t->end_led = doc["r"][1];
-                t->speed = doc["spd"];
+                t->speed = doc["spd"].as<float>();
                 t->c1 = hexToRgb(doc["c1"]);
                 t->c2 = hexToRgb(doc["c2"]);
                 t->color_change = (doc["cg"] == 1);
@@ -308,13 +308,13 @@ void handleJsonInput(String jsonInput) {
 
                 t->is_turning_off = false;
                 t->turn_off_start_time = 0;
-                t->turn_off_speed = 0;
+                t->turn_off_speed = 0.0f;
 
                 g_anyTaskActive = true;
             } 
             else if (cmd == 0) { // Stop Task
                 bool has_spd = doc.containsKey("spd");
-                int spd = has_spd ? doc["spd"] : 0;
+                float spd = has_spd ? doc["spd"].as<float>() : 0.0f;
 
                 if (doc.containsKey("r")) {
                     int r_start = doc["r"][0];
@@ -328,7 +328,7 @@ void handleJsonInput(String jsonInput) {
                             int t_max = max(g_tasks[idx][i].start_led, g_tasks[idx][i].end_led);
                             
                             if (t_min <= max_r && t_max >= min_r) {
-                                if (has_spd && spd > 0) {
+                                if (has_spd && spd > 0.0f) {
                                     g_tasks[idx][i].is_turning_off = true;
                                     g_tasks[idx][i].turn_off_start_time = millis();
                                     g_tasks[idx][i].turn_off_speed = spd;
@@ -339,7 +339,7 @@ void handleJsonInput(String jsonInput) {
                         }
                     }
 
-                    if (!has_spd || spd <= 0) {
+                    if (!has_spd || spd <= 0.0f) {
                         for (int i = min_r; i <= max_r; i++) {
                             setPixel(idx, i, RgbColor(0));
                         }
@@ -349,7 +349,7 @@ void handleJsonInput(String jsonInput) {
                 } else {
                     for (int i = 0; i < MAX_TASKS_PER_PIN; i++) {
                         if (g_tasks[idx][i].active) {
-                            if (has_spd && spd > 0) {
+                            if (has_spd && spd > 0.0f) {
                                 g_tasks[idx][i].is_turning_off = true;
                                 g_tasks[idx][i].turn_off_start_time = millis();
                                 g_tasks[idx][i].turn_off_speed = spd;
@@ -358,7 +358,7 @@ void handleJsonInput(String jsonInput) {
                             }
                         }
                     }
-                    if (!has_spd || spd <= 0) {
+                    if (!has_spd || spd <= 0.0f) {
                         clearStrip(idx); 
                         showStrip(idx); // Được gọi tuần tự nhờ hàm showStrip()
                     }
@@ -399,10 +399,10 @@ void update_led_effects() {
             int direction = (t->end_led >= t->start_led) ? 1 : -1;
             int num_leds;
             
-            if (t->speed <= 0) {
+            if (t->speed <= 0.0f) {
                 num_leds = abs(t->end_led - t->start_led) + 1;
             } else {
-                num_leds = (effective_elapsed * t->speed) / 1000;
+                num_leds = (int)((effective_elapsed * t->speed) / 1000.0f);
             }
 
             int current_end = t->start_led + (num_leds * direction);
@@ -414,7 +414,7 @@ void update_led_effects() {
             
             if (t->is_turning_off) {
                 uint32_t off_elapsed = now - t->turn_off_start_time;
-                int off_num_leds = (off_elapsed * t->turn_off_speed) / 1000;
+                int off_num_leds = (int)((off_elapsed * t->turn_off_speed) / 1000.0f);
                 current_start = t->start_led + (off_num_leds * direction);
 
                 if ((direction == 1 && current_start > current_end) || 

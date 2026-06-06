@@ -18,7 +18,7 @@
 #define NUM_CHANNELS 6
 
 // Cấu hình Scale vật lý để đèn không nháy ở mức thấp
-#define PHYSICAL_MIN 10
+#define PHYSICAL_MIN 0
 #define PHYSICAL_MAX 255
 
 // Ngưỡng thời gian tối thiểu để thực hiện hiệu ứng Fade (ms)
